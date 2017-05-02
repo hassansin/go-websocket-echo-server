@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
@@ -19,6 +18,18 @@ const bufferSize = 4096
 
 type Conn interface {
 	Close() error
+}
+
+var closeCodes map[int]string = map[int]string{
+	1000: "NormalError",
+	1001: "GoingAwayError",
+	1002: "ProtocolError",
+	1003: "UnknownType",
+	1007: "TypeError",
+	1008: "PolicyError",
+	1009: "MessageTooLargeError",
+	1010: "ExtensionError",
+	1011: "UnexpectedError",
 }
 
 func getAcceptHash(key string) string {
@@ -111,13 +122,26 @@ func (ws *Ws) validate(fr *Frame) error {
 		ws.status = 1002
 		return errors.New("protocol error: RSV " + fmt.Sprintf("%x", fr.Reserved) + " is reserved")
 	}
-	if fr.Opcode == 1 && !utf8.Valid(fr.Payload) {
+	if fr.Opcode == 1 && !fr.IsFragment && !utf8.Valid(fr.Payload) {
 		ws.status = 1007
 		return errors.New("wrong code: invalid UTF-8 text message ")
 	}
-	if fr.Opcode == 8 && fr.Length == 1 {
-		ws.status = 1002
-		return errors.New("protocol error: close frame with payload length 1 ")
+	if fr.Opcode == 8 {
+		if fr.Length >= 2 {
+			code := binary.BigEndian.Uint16(fr.Payload[:2])
+			reason := utf8.Valid(fr.Payload[2:])
+			if code >= 5000 || (code < 3000 && closeCodes[int(code)] == "") {
+				ws.status = 1002
+				return errors.New(closeCodes[1002] + " Wrong Code")
+			}
+			if fr.Length > 2 && !reason {
+				ws.status = 1007
+				return errors.New(closeCodes[1007] + " invalid UTF-8 reason message")
+			}
+		} else if fr.Length != 0 {
+			ws.status = 1002
+			return errors.New(closeCodes[1002] + " Wrong Code")
+		}
 	}
 	return nil
 }
@@ -140,25 +164,17 @@ func (ws *Ws) Recv() (Frame, error) {
 	length = uint64(head[1] & 0x7F)
 
 	if length == 126 {
-		var len16 uint16
 		data, err := ws.read(2)
 		if err != nil {
 			return frame, err
 		}
-		err = binary.Read(bytes.NewReader(data), binary.BigEndian, &len16)
-		if err != nil {
-			return frame, err
-		}
-		length = uint64(len16)
+		length = uint64(binary.BigEndian.Uint16(data))
 	} else if length == 127 {
 		data, err := ws.read(8)
 		if err != nil {
 			return frame, err
 		}
-		err = binary.Read(bytes.NewReader(data), binary.BigEndian, &length)
-		if err != nil {
-			return frame, err
-		}
+		length = uint64(binary.BigEndian.Uint64(data))
 	}
 	mask, err := ws.read(4)
 	if err != nil {
@@ -187,21 +203,19 @@ func (ws *Ws) Send(fr Frame) error {
 		data[0] &= 0x7F
 	}
 
-	buf := new(bytes.Buffer)
-	if err := binary.Write(buf, binary.BigEndian, fr.Length); err != nil {
-		return err
-	}
 	if fr.Length <= 125 {
 		data[1] = byte(fr.Length)
 		data = append(data, fr.Payload...)
 	} else if fr.Length > 125 && float64(fr.Length) < math.Pow(2, 16) {
 		data[1] = byte(126)
-		size := buf.Bytes()
-		data = append(data, size[len(size)-2:len(size)]...)
+		size := make([]byte, 2)
+		binary.BigEndian.PutUint16(size, uint16(fr.Length))
+		data = append(data, size...)
 		data = append(data, fr.Payload...)
 	} else if float64(fr.Length) >= math.Pow(2, 16) {
 		data[1] = byte(127)
-		size := buf.Bytes()
+		size := make([]byte, 8)
+		binary.BigEndian.PutUint64(size, fr.Length)
 		data = append(data, size...)
 		data = append(data, fr.Payload...)
 	}
@@ -211,13 +225,10 @@ func (ws *Ws) Send(fr Frame) error {
 // Close sends close frame and closes the TCP connection
 func (ws *Ws) Close() error {
 	f := Frame{}
-	buf := new(bytes.Buffer)
-	if err := binary.Write(buf, binary.BigEndian, ws.status); err != nil {
-		return err
-	}
 	f.Opcode = 8
 	f.Length = 2
-	f.Payload = buf.Bytes()
+	f.Payload = make([]byte, 2)
+	binary.BigEndian.PutUint16(f.Payload, ws.status)
 	if err := ws.Send(f); err != nil {
 		return err
 	}
